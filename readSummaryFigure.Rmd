@@ -1,0 +1,375 @@
+---
+title: "Read summary figure"
+author: "Jason Byars"
+date: "2/10/2016"
+output: html_document
+---
+
+This generates the counts for the read summary figure in the RNA prep comparison paper. Let's get the file list and make sure the names match up properly.
+
+Copy all the data local
+```{r }
+system.time(system('aws s3 sync s3://atg-datalake-test/rna_prep_comparison/tmapredo /data/tmapredo', intern=T))
+system.time(system('aws s3 sync s3://atg-datalake-test/rna_prep_comparison/star     /data/star', intern=T))
+system.time(system('aws s3 sync s3://atg-datalake-test/rna_prep_comparison/marked   /data/marked', intern=T))
+system.time(system('aws s3 sync s3://atg-datalake-test/rna_prep_comparison/cuffgtf  /data/cuffgtf', intern=T))
+system.time(system('aws s3 sync s3://atg-datalake-test/rna_prep_comparison/htseq_exons_tmap /data/htseq_exons_tmap', intern=T))
+# need a reference for the ribo trick
+system.time(system('aws s3 cp s3://atg-darth/reference/GencodeV19/gencode.v19.chr_patch_hapl_scaff.annotation.gtf.gz /data/gencode.v19.chr_patch_hapl_scaff.annotation.gtf.gz'))
+
+```
+
+```{r message=FALSE,results='asis'}
+library(knitr)
+library(parallel)
+library(Rsamtools)
+library(foreach)
+library(iterators)
+library(doMC)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(data.table)
+
+tmapfiles <- dir(path="/data/tmapredo/", pattern=".*bam$", full.names = T)
+starfiles <- dir(path="/data/star", pattern=".*Aligned.*bam$", full.names = T)
+markedfiles <- dir(path="/data/marked", pattern=".*Aligned.*bam$", full.names=T)
+
+tmapfiles <- tmapfiles[order(sub(pattern=".bam",replacement = "", basename(tmapfiles), fixed=T))]
+starfiles <- starfiles[order(sub(pattern="_Aligned.sortedByCoord.out.bam",replacement = "", basename(starfiles)))]
+markedfiles <- markedfiles[order(sub(pattern="_Aligned.sortedByCoord.out.bam",replacement = "", basename(markedfiles)))]
+
+#sanity <- data.frame(tmap=basename(tmapfiles),star=basename(starfiles),marked=basename(markedfiles), #fixed=basename(starfiles)[order(sub(pattern="_Aligned.sortedByCoord.out.bam",replacement = "", basename(starfiles)))])
+
+samples <- data.frame(tmapfiles, starfiles, markedfiles)
+rownames(samples) <- sub(".bam","",sub("rna_","",basename(tmapfiles)))
+preview <- data.frame(tmap=basename(tmapfiles),star=basename(starfiles),marked=basename(markedfiles))
+kable(preview, format="markdown")
+```
+
+We can get the total number of reads from the tmap counts and the unaligned read counts from the STAR results.
+
+```{r cache=TRUE}
+
+countReads <- function(filename) {
+  df <- data.frame(strings=system(paste("samtools idxstats ", filename), intern = T))
+  totalreads <- df %>% separate(strings, into=c("gene","length","counts","unaligned"),sep = "\t") %>% 
+    summarise("Total Reads"=sum(as.integer(counts))+sum(as.integer(unaligned)))
+  totalaligned <- df %>% separate(strings, into=c("gene","length","counts","unaligned"),sep = "\t") %>% 
+    summarise("Tmap Total Mapped Read Count"=sum(as.integer(counts)))
+  totalunaligned <- df %>% separate(strings, into=c("gene","length","counts","unaligned"),sep = "\t") %>% 
+    summarise("Tmap Total Unmapped Read Count"=sum(as.integer(unaligned)))
+  
+  out <- data.frame(totalreads, totalaligned, totalunaligned, "Tmap.Percent.Mapped"=totalaligned[[1]]/totalreads[[1]])
+  rownames(out) <- basename(filename)
+  out
+}
+# fast enough sequential, but good way to check parallel is working right
+registerDoMC(cores=8)
+tmapTotalReads <- ldply(tmapfiles, countReads, .parallel=TRUE)
+rownames(tmapTotalReads) <- basename(tmapfiles)
+
+countStarIndex <- function(filename) {
+  df <- data.frame(strings=system(paste("samtools idxstats ", filename), intern = T))
+  totalaligned <- df %>% separate(strings, into=c("gene","length","counts","unaligned"),sep = "\t") %>% 
+    summarise("Star Total Alignment Count"=sum(as.integer(counts)))
+  totalunaligned <- df %>% separate(strings, into=c("gene","length","counts","unaligned"),sep = "\t") %>% 
+    summarise("Star Total Unmapped Read Count"=sum(as.integer(unaligned)))
+  rrna <- df %>% separate(strings, into=c("gene","length","counts","unaligned"),sep = "\t") %>% filter(gene=="GL000220.1") %>% select(counts)
+  out <- data.frame(totalaligned, totalunaligned, "Star Alignments Mapped to rRNA"=rrna[[1]])
+  rownames(out) <- basename(filename)
+  out
+}
+
+registerDoMC(cores=8)
+starindex <- ldply(starfiles,countStarIndex, .parallel=TRUE)
+
+```
+
+Count the unique star alignments. 
+```{r cache=TRUE}
+countUnique <- function(filename) {
+  param <- ScanBamParam(what=c("flag","mapq"),flag = scanBamFlag(isUnmappedQuery=F))
+  bam <- scanBam(filename, param=param)[[1]]
+  browser()
+  out <- data.frame("unique aligned reads"=sum(bam$mapq==255),
+                    "uniquely aligned reads without duplicates"=sum(bam$mapq==255 & bamFlagTest(bam$flag,'isDuplicate')==F),
+                    "duplicate reads"=sum(bamFlagTest(bam$flag,'isDuplicate')==T & bamFlagTest(bam$flag,'isSecondaryAlignment')==F))
+}
+registerDoMC(cores=8)
+uniqueAlignments <- ldply(markedfiles,countUnique, .parallel=TRUE)
+```
+
+```{r cache=TRUE}
+library(GenomicAlignments)
+library(rtracklayer)
+
+genomeCoverage <- mclapply(starfiles, function(x) {
+  cvg = coverage(BamFile(x))
+  sum(as.numeric(lengths(cvg[cvg>0])))/sum(as.numeric(lengths(cvg)))
+}, mc.cores = 8)
+
+refseq <- import.gff("/home/ubuntu/RefSeq_hg19_exons_nodups_021114g1k.gff")
+refseq$gene <- sub("_exon_[0-9]+","",refseq$gene_id)
+
+# precomputing the "transcript length" ahead of time is way faster
+refseq$width <- width(refseq)
+txlength <- tapply(refseq$width,refseq$gene,sum)
+
+#param <- ScanBamParam(which=refseq)
+#aligments <- readGAlignments(starfiles[[1]],param=param)
+#pparam <- PileupParam(distinguish_nucleotides=FALSE,
+#                       distinguish_strands=FALSE)
+
+#incredibly slow do not use!
+#foo <- pileup(BamFile(starfiles[[1]]), scanBamParam=param, pileupParam=pparam)
+#bar <- GRanges(seqnames=foo$seqnames, ranges=IRanges(start=foo$pos,end=foo$pos),which_label=foo$which_label,count=foo$count)
+
+#meancoverage <- sapply(refseq$gene, function(x) {
+#  transcript_length <- sum(width(refseq[refseq$gene==x]))
+#  sum(overlapsAny(bar,refseq[refseq$gene==x]))/transcript_length
+#}  )
+
+#coverage calculated w/ bedtools genomecov -bga -split
+bedgraph <- import.bedGraph("/data/star/rna_01pg_F-P21-M1-65-1_run72_016_Aligned.bedgraph.gz")
+# this probably isn't necessary, but some GRanges operations whine otherwise
+seqlevels(refseq) <- seqlevels(bedgraph)
+# get the coverage info overlapping exons
+foo <- subsetByOverlaps(bedgraph,refseq)
+# track the gene names back on those ranges
+foo$gene <- mcols(refseq)[findOverlaps(foo,refseq,select="first"),]$gene
+# we have the over lapping ranges, but they haven't been trimmed to fit the exons
+refhit <- findOverlaps(foo,refseq,select="first")
+start(foo) <- ifelse(start(foo)>=start(refseq[refhit]),start(foo),start(refseq[refhit]))
+end(foo) <- ifelse(end(foo)<=end(refseq[refhit]),end(foo),end(refseq[refhit]))
+# now we are ready to compute coverage
+# still subsetting, so still not super fast, but better than before
+transcriptomeCoverage <- unlist(mclapply(unique(foo$gene), function(x) {
+  # get all the coverage counts
+  g <- foo[foo$gene==x]
+  sum(width(g)*g$score)/txlength[x] 
+  }, mc.cores=16))
+mean(transcriptomeCoverage)
+
+```
+
+```{r cache=TRUE}
+
+bedgraphfiles <- dir("/data/star",pattern=".*_Aligned.sortedByCoord.out.bedgraph.gz$", full.names=T)
+
+refseq <- import.gff("/home/ubuntu/RefSeq_hg19_exons_nodups_021114g1k.gff")
+refseq$gene <- sub("_exon_[0-9]+","",refseq$gene_id)
+
+# precomputing the "transcript length" ahead of time is way faster
+refseq$width <- width(refseq)
+txlength <- tapply(refseq$width,refseq$gene,sum)
+
+avgreaddepth <- function(fname) {
+  bedgraph <- import.bedGraph(fname)
+# this probably isn't necessary, but some GRanges operations whine otherwise
+  seqlevels(refseq) <- seqlevels(bedgraph)
+# get the coverage info overlapping exons
+  foo <- subsetByOverlaps(bedgraph,refseq)
+# track the gene names back on those ranges
+  foo$gene <- mcols(refseq)[findOverlaps(foo,refseq,select="first"),]$gene
+# we have the over lapping ranges, but they haven't been trimmed to fit the exons
+  refhit <- findOverlaps(foo,refseq,select="first")
+  start(foo) <- ifelse(start(foo)>=start(refseq[refhit]),start(foo),start(refseq[refhit]))
+  end(foo) <- ifelse(end(foo)<=end(refseq[refhit]),end(foo),end(refseq[refhit]))
+  transcriptomeCoverage <- unlist(mclapply(unique(foo$gene), function(x) {
+    # get all the coverage counts
+    g <- foo[foo$gene==x]
+    sum(width(g)*g$score)/txlength[x] 
+    }, mc.cores=16))
+  mean(transcriptomeCoverage)
+}
+
+avgReadDepthPerGene <- sapply(bedgraphfiles, avgreaddepth)
+
+mmdovertrans <- function(fname) {
+  bedgraph <- import.bedGraph(fname)
+# this probably isn't necessary, but some GRanges operations whine otherwise
+  seqlevels(refseq) <- seqlevels(bedgraph)
+# get the coverage info overlapping exons
+  foo <- subsetByOverlaps(bedgraph,refseq)
+# track the gene names back on those ranges
+  foo$gene <- mcols(refseq)[findOverlaps(foo,refseq,select="first"),]$gene
+# we have the over lapping ranges, but they haven't been trimmed to fit the exons
+  refhit <- findOverlaps(foo,refseq,select="first")
+  start(foo) <- ifelse(start(foo)>=start(refseq[refhit]),start(foo),start(refseq[refhit]))
+  end(foo) <- ifelse(end(foo)<=end(refseq[refhit]),end(foo),end(refseq[refhit]))
+  totalCoverage <- unlist(mclapply(unique(foo$gene), function(x) {
+    # get all the coverage counts
+    g <- foo[foo$gene==x]
+    sum(width(g)*g$score) 
+    }, mc.cores=16))
+  totalLength <- sum(txlength[unique(foo$gene)])
+  sum(totalCoverage)/totalLength
+}
+
+mmdOverTranscriptome <- sapply(bedgraphfiles, mmdovertrans)
+```
+
+We need to pull in the cufflinks results to get isoform information.
+```{r cache=TRUE}
+myb <- GRanges(seqnames="6", ranges=IRanges(start=135492452, end=135550311))
+
+gtffiles <- dir("/data/cuffgtf/", pattern="transcripts_sorted.gtf$", recursive = T, full.names = T)
+getTranscriptTable <- function(filename) {
+  gff <- import.gff(filename,format="gtf")
+  as.data.frame(gff[gff$type=="transcript"])
+}
+
+gtfs <- mclapply(gtffiles,getTranscriptTable, mc.cores = 8)
+# you can add the .id column when you load the file
+names(gtfs) <- sub("_Aligned.sortedByCoord.out","",basename(sub("/transcripts_sorted.gtf","",gtffiles)))
+fixedgtfs <- foreach (i = iter(gtfs), n = iter(names(gtfs))) %do% cbind(.id=n,i)
+cufftbl <- rbindlist(fixedgtfs)
+
+isoforms.expressed <- tapply(cufftbl$cov,cufftbl$.id, function(x) sum(x>=1.0))
+# this is REALLY ugly rewrite
+foo <- tapply(cufftbl$cov,paste(cufftbl$.id,cufftbl$gene_id,sep="_"), function(x) any(x>=1.0))
+genes.expressed <- tapply(foo, sub("_ENSG[0-9]+$","",names(foo)), sum)
+
+```
+
+We need to read counts mapped to genes. We can do that quickly using numbers from htseq, but we must look at the ambigious and no feature counts to make sure something has not gone seriously wrong!
+
+```{r htseq,cache=TRUE}
+countfiles <- dir(path="/data/htseq_exons_tmap/", pattern=".*_summary_stats.txt", full.names = T)
+countstbl <- sapply(countfiles, function(x) { 
+  counts <- read.table(x, sep=":")
+  foo <- counts$V2
+  names(foo) <- counts$V1
+  foo
+})
+countstbl <- as.data.frame(t(cbind(countstbl)))
+rownames(countstbl) <- sub("_summary_stats.txt","",basename(countfiles))
+```
+
+Now we need the ribosomal percentage. To do that we just need to count primary alignments on rRNA location in Ensembl references and anything on GL000220.1.
+
+```{r ribo,cache=TRUE}
+ensembl75 <- import.gff("/data/gencode.v19.chr_patch_hapl_scaff.annotation.gtf.gz", format="gtf")
+ensembl75rrna <- ensembl75[ensembl75$gene_type=="rRNA"]
+# chr1 -> chr
+seqlevels(ensembl75rrna) <- sub("^chr","", seqlevels(ensembl75rrna))
+#exclude GL000250.1
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000250.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000251.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000252.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000253.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000254.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000255.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000258.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL383560.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL383567.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL582976.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL877872.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL877873.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH159134.2"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH159142.2"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH591181.2"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH591184.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH636052.4"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH636058.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH720453.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH806587.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH806590.2"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH806597.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="JH806600.2"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="KB021645.1"]
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="KB663606.1"]
+
+# count all of GL220.1 161802 this still isn't right
+example <- ensembl75rrna[seqnames(ensembl75rrna)=="GL000220.1"][1]
+start(example) <- 1
+end(example) <- 161802
+strand(example) <- "+"
+ensembl75rrna <- ensembl75rrna[seqnames(ensembl75rrna)!="GL000220.1"]
+ensembl75rrna <- append(ensembl75rrna, example)
+ensembl75rrna <- sort(ensembl75rrna)
+
+smushed <- reduce(ensembl75rrna)
+param <- ScanBamParam(flag=scanBamFlag(isSecondaryAlignment=F), which=smushed)
+
+# this gets the wrong counts, don't do this
+#rrnaReads <- mclapply(starfiles, function(f) {
+#  df <- countBam(f, param=param)
+#  sum(df$records)
+#}, mc.cores=8)
+
+# I can't figure out why secondary alignments are getting read in sometimes. We'll just have a do a unique call on the read names to sort it out.
+rrnaReads <- mclapply(starfiles, function(f) {
+  df <- readGAlignments(f, param=param, use.names = T)
+  length(unique(names(df)))
+}, mc.cores=8)
+```
+
+Now we can assemble the final table.
+```{r results='asis'}
+tbl <- data.frame("Mapping (%) of total align read"=(tmapTotalReads$Total.Reads - starindex$Star.Total.Unmapped.Read.Count) /tmapTotalReads$Total.Reads*100,
+  "Percent duplication"=uniqueAlignments$duplicate.reads/tmapTotalReads$Total.Reads*100,
+  "Unique isoforms"=isoforms.expressed,
+  "Genes expressed"=genes.expressed,
+  "Total raw reads (millions)"=tmapTotalReads$Total.Reads, 
+  "Uniquely aligned reads"=uniqueAlignments$unique.aligned.reads,
+  "Uniquely aligned reads without duplicates"=uniqueAlignments$uniquely.aligned.reads.without.duplicates, 
+  "Reads mapped to genes"=countstbl$Reads_on_features,
+  "No_feature"=countstbl$No_feature,
+  "Ambiguous"=countstbl$Ambiguous,
+  "too_low_Quality"=countstbl$too_low_Quality,
+  "Average read depth.gene"=avgReadDepthPerGene,
+  "Mean mapped depth over transcriptome"=mmdOverTranscriptome,
+  "Percent of ref genome covered"=unlist(genomeCoverage)*100,
+  "Ribosomal percentage"=unlist(rrnaReads)/tmapTotalReads$Total.Reads*100)
+kable(tbl, format="markdown")
+```
+
+```{r}
+library(xlsx)
+write.xlsx(tbl, "readsummarytable.xlsx", sheetName="rna_prep")
+```
+
+***Mapping % of total align reads*** Total percentage of reads aligned by STAR.
+
+***Duplication %*** How do you want to handle multi aligners? Duplicate flag = true & primary alignment flag = true/total reads
+
+***Coverage uniformity*** uniformity of read depth across each exon, trying using median absolute deviation stat
+
+***Unique isoforms*** total count of cufflinks cov >= 1
+
+***Genes expressed*** total genes with expression on at least 1 isoform
+
+***Total Raw Reads*** is the original total number of reads from the sequencer for a given sample. Both aligned and unaligned reads count. We simply grab the index file and add up all the alignments on the contigs plus the unaligned. We get the same answer as **samtools flagstat** in a few seconds for all samples.
+
+***Uniquely aligned reads*** The total number of reads aligned with star that have a MAPQ of 255. MAPQ of 255 means a unique aligner for STAR.
+
+***Uniquely aligned reads without dups*** STAR results marked for duplicates by sambamba or Picard Tools. MAPQ == 255 and duplicate flag is false. Note, this will over estimate the number of duplicates!
+
+***Reads mapped to Genes*** ht-seq counts, ambigious, and no feature
+
+***Average read depth/gene*** average read depth across all exons of gene with duplicates. Average of that value across all genes with at least 1 read on an exon.
+
+***Mean mapped depth over transcriptome*** over the transcriptome, genes that we decide are actually expressed? With or without duplicates?
+
+***Percent of ref genome covered*** percent of entire genome with at least 1 read covering the positions. This is without any quality filters. Garbage alignments count! 
+
+***Ribosomal percentage*** percentage of total reads mapping to GL0000220.1 or know rRNA position defined by Ensembl
+
+
+```{r debugging}
+param <- ScanBamParam(flag=scanBamFlag(isSecondaryAlignment=F), which=smushed, what=c("mapq","flag"))
+
+orig <- readGAlignments(starfiles[[1]],param=param, use.names=T) #6698572 
+problem <- readGAlignments(starfiles[[1]],param=param, use.names=T) #6633048 
+gains <- setdiff(names(problem),names(orig))
+missing <- setdiff(names(orig),names(problem))
+common <- intersect(names(orig),names(problem)) # 6632752
+
+length(unique(names(orig))) # 6632752  65820 duplicate reads?!? WHY!!!!!
+length(unique(names(problem))) # 6633027
+# gain of 275 reads
+
+```
